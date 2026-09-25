@@ -6,7 +6,44 @@ Laya answers typed questions (`choice`, `score`, `noul`) about text without gene
 asks whether the same thing works when the state is an image: same question format, same decision head,
 same proper-scoring objective, with a frozen vision encoder feeding the text encoder.
 
-Status: private experiment. Pilot numbers below; nothing here is a benchmark yet.
+Status: private experiment. Nothing here is a benchmark yet.
+
+Two parts:
+
+- **`laya_vision/judge/`: Laya as the decision layer of a VLM judge** (current focus). Three backends, one evaluator.
+- **`laya_vision/` (model, train): SigLIP tokens fed into Laya's text encoder** (first pilot). Finding: on
+  A-OKVQA it learned the answer-wording prior, not the image (45.2% with the right image vs 44.1% with a
+  shuffled one). Kept for reference; the judge work is the follow-up.
+
+## Judge framework
+
+Every backend answers Laya-typed questions (`choice`, `score`, `noul`) about an image and returns a
+probability vector over the same options, so one evaluator scores them all.
+
+| backend | how | training |
+|---|---|---|
+| `letters` | VLM prompt with lettered options (or Yes/No, or 1..K); softmax over those next-token logits. The usual VLM-as-judge, in one pass | none |
+| `caption` | VLM writes one detailed description per image; released Laya answers every typed question about that text | none |
+| `vlm_head` | VLM reads image + question + options, each option closed by `<\|quad_end\|>`; Laya's typed scorer reads the hidden state at each marker. No decoding | LoRA + head, Laya proper-scoring loss |
+
+VLM: `Qwen/Qwen2.5-VL-3B-Instruct` for all three, so differences come from the decision layer.
+
+Eval (`laya_vision/judge/evaluate.py`):
+
+- **A-OKVQA validation**: `choice` accuracy and ECE; `noul` accuracy, balanced accuracy, and choice recovered from noul
+- **GenAI-Bench test** (prompt index % 4 == 0; 400 prompts x 6 generators): `score` 1..5 vs human Likert
+  ratings, Spearman, and **within-prompt pairwise accuracy**, which is the quantity a diffusion RL reward needs
+- **Shuffled-image check** on both: same questions, other images. Reports the accuracy gain from the real
+  image and how much the expected score drops
+- **Latency**: one image with all its questions, on an A100
+
+`vlm_head` trains on A-OKVQA train (choice, noul, image-swap noul pairs) and GenAI-Bench train prompts
+(score, soft targets from the human rating histogram). Test prompts are never used in training.
+
+```bash
+modal run modal_judge.py --backend letters --smoke            # wiring check on tiny subsets
+modal run --detach modal_judge.py --backend letters           # or caption / vlm_head
+```
 
 ## How it works
 
