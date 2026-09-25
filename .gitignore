@@ -5,3 +5,4 @@ runs/
 *.pt
 *.safetensors
 .pytest_cache/
+*.log
