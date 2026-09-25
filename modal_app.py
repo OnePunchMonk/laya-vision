@@ -46,8 +46,40 @@ def train(cfg: dict) -> dict:
     return res
 
 
+CARD = """---
+license: apache-2.0
+base_model: [convaiinnovations/laya, google/siglip2-base-patch16-224]
+tags: [laya, vision, decision-model, private-experiment]
+---
+# laya-vision / {run}
+
+Private experiment: Laya's typed decision head over SigLIP2 image tokens, trained on A-OKVQA.
+Code: github.com/OnePunchMonk/laya-vision (private). Not a benchmark.
+
+```json
+{summary}
+```
+"""
+
+
+@app.function(timeout=1800, **common)
+def push(run_name: str, repo_id: str) -> str:
+    from huggingface_hub import HfApi
+
+    run_dir = "/vol/runs/%s" % run_name
+    res = json.load(open(os.path.join(run_dir, "results.json")))
+    keys = ["laya_text_only_zero_shot", "with_image", "shuffled_image", "latency", "train_minutes"]
+    with open(os.path.join(run_dir, "README.md"), "w") as f:
+        f.write(CARD.format(run=run_name, summary=json.dumps({k: res.get(k) for k in keys}, indent=2)))
+    api = HfApi()
+    api.create_repo(repo_id, private=True, exist_ok=True)
+    api.upload_folder(folder_path=run_dir, repo_id=repo_id, path_in_repo=run_name, commit_message="Add run %s" % run_name)
+    return "https://huggingface.co/%s/tree/main/%s" % (repo_id, run_name)
+
+
 @app.local_entrypoint()
-def main(epochs: int = 3, limit: int = 0, batch_size: int = 32, name: str = ""):
+def main(epochs: int = 3, limit: int = 0, batch_size: int = 32, name: str = "",
+         hf_repo: str = "OnePunchMonk101010/laya-vision", no_push: bool = False):
     train_feats = cache_features.remote("train", limit)
     val_feats = cache_features.remote("validation", limit // 4 if limit else 0)
     run_name = name or ("smoke" if limit else "pilot_e%d" % epochs)
@@ -73,3 +105,5 @@ def main(epochs: int = 3, limit: int = 0, batch_size: int = 32, name: str = ""):
         json.dump(res, f, indent=2)
     keys = ["laya_text_only_zero_shot", "with_image", "shuffled_image", "latency", "train_minutes"]
     print(json.dumps({k: res.get(k) for k in keys}, indent=2))
+    if not no_push:
+        print("pushed (private):", push.remote(run_name, hf_repo))

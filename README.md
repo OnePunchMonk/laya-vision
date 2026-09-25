@@ -53,8 +53,10 @@ modal run modal_app.py --limit 400 --epochs 1  # smoke, a few minutes on one L4
 modal run modal_app.py                         # pilot, full train split, 3 epochs
 ```
 
-Needs a Modal secret named `huggingface`. Outputs land on the `laya-vision` volume under `runs/<name>/`
-and a local copy of `results.json` in `runs/`.
+Needs a Modal secret named `huggingface` with a write token. Outputs land on the `laya-vision` volume under
+`runs/<name>/`, a local copy of `results.json` goes to `runs/`, and the run folder (weights, config,
+results, card) is uploaded to the **private** HF repo `OnePunchMonk101010/laya-vision` under `<name>/`.
+Pass `--no-push` to skip the upload, or `--hf-repo` to change the target.
 
 ## Where this is going
 
