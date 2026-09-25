@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "laya-vision"
+version = "0.0.1"
+description = "Typed decisions over images in one forward pass, built on Laya"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "laya>=0.3.4",
+    "torch>=2.1",
+    "transformers>=4.49,<5",
+    "datasets>=2.18",
+    "safetensors>=0.4",
+    "pillow",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "modal"]
+
+[tool.setuptools.packages.find]
+include = ["laya_vision*"]
