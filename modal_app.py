@@ -1,7 +1,10 @@
 """Modal entrypoints.
 
-    modal run modal_app.py --limit 400 --epochs 1   # smoke test, a few minutes on one L4
-    modal run modal_app.py                          # pilot: full A-OKVQA train, 3 epochs
+    modal run modal_app.py --exp smoke                  # a few minutes on one L4
+    modal run --detach modal_app.py --exp main          # long run, survives closing the terminal
+    modal run --detach modal_app.py --exp frozen_text   # ablations, see EXPERIMENTS
+
+A run killed mid-way (preemption, retry) resumes from runs/<name>/last.pt on the volume.
 
 Feature caches, HF downloads and run outputs live on the `laya-vision` volume.
 """
@@ -37,12 +40,40 @@ def cache_features(split: str, limit: int = 0) -> str:
     return path
 
 
-@app.function(gpu="L4", timeout=4 * 3600, **common)
+BASE = {
+    "init": "laya",               # laya | modernbert (same encoder, fresh head)
+    "train_text": True,           # False: only projector, head and scorer train
+    "laya_id": "convaiinnovations/laya",
+    "laya_subfolder": None,
+    "vision_id": "google/siglip2-base-patch16-224",
+    "dataset": "HuggingFaceM4/A-OKVQA",
+    "batch_size": 32,
+    "lr_text": 2e-5,
+    "lr_new": 5e-4,
+    "warmup_epochs": 0.5,
+    "max_epochs": 100,
+    "patience": 10,               # epochs without dev improvement before stopping
+    "lr_halve_after": 3,          # halve LR every 3 bad epochs
+    "min_delta": 0.0,
+    "dev_rows": 1000,             # tail of A-OKVQA train, used for all selection
+    "seed": 0,
+    "limit": 0,
+}
+EXPERIMENTS = {
+    "smoke": {"limit": 400, "max_epochs": 3, "patience": 2, "lr_halve_after": 1},
+    "main": {},
+    "frozen_text": {"train_text": False},       # how much must the text encoder adapt?
+    "no_laya_init": {"init": "modernbert"},     # does Laya's decision pretraining help?
+}
+
+
+@app.function(gpu="L4", timeout=24 * 3600, retries=modal.Retries(max_retries=2, initial_delay=10.0), **common)
 def train(cfg: dict) -> dict:
     from laya_vision.train import run
 
-    res = run(cfg)
-    vol.commit()
+    res = run(cfg, on_epoch=vol.commit)
+    if cfg.get("push_repo"):
+        res["hf_url"] = push_run(cfg["run"], cfg["push_repo"])
     return res
 
 
@@ -62,13 +93,13 @@ Code: github.com/OnePunchMonk/laya-vision (private). Not a benchmark.
 """
 
 
-@app.function(timeout=1800, **common)
-def push(run_name: str, repo_id: str) -> str:
+def push_run(run_name: str, repo_id: str) -> str:
+    """Upload a finished run folder (weights, config, results, metrics, card) to a private HF repo."""
     from huggingface_hub import HfApi
 
     run_dir = "/vol/runs/%s" % run_name
     res = json.load(open(os.path.join(run_dir, "results.json")))
-    keys = ["laya_text_only_zero_shot", "with_image", "shuffled_image", "latency", "train_minutes"]
+    keys = ["laya_text_only_zero_shot", "with_image", "shuffled_image", "stopped", "latency", "train_minutes"]
     with open(os.path.join(run_dir, "README.md"), "w") as f:
         f.write(CARD.format(run=run_name, summary=json.dumps({k: res.get(k) for k in keys}, indent=2)))
     api = HfApi()
@@ -77,33 +108,25 @@ def push(run_name: str, repo_id: str) -> str:
     return "https://huggingface.co/%s/tree/main/%s" % (repo_id, run_name)
 
 
+@app.function(timeout=1800, **common)
+def push(run_name: str, repo_id: str) -> str:
+    return push_run(run_name, repo_id)
+
+
 @app.local_entrypoint()
-def main(epochs: int = 3, limit: int = 0, batch_size: int = 32, name: str = "",
-         hf_repo: str = "OnePunchMonk101010/laya-vision", no_push: bool = False):
-    train_feats = cache_features.remote("train", limit)
-    val_feats = cache_features.remote("validation", limit // 4 if limit else 0)
-    run_name = name or ("smoke" if limit else "pilot_e%d" % epochs)
-    cfg = {
-        "run": run_name,
-        "laya_id": "convaiinnovations/laya",
-        "laya_subfolder": None,
-        "vision_id": "google/siglip2-base-patch16-224",
-        "dataset": "HuggingFaceM4/A-OKVQA",
-        "train_feats": train_feats,
-        "val_feats": val_feats,
-        "out_dir": "/vol/runs/%s" % run_name,
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "lr_text": 2e-5,
-        "lr_new": 5e-4,
-        "seed": 0,
-        "limit": limit,
-    }
+def main(exp: str = "main", seed: int = 0, hf_repo: str = "OnePunchMonk101010/laya-vision", no_push: bool = False):
+    cfg = {**BASE, **EXPERIMENTS[exp], "seed": seed}
+    run_name = exp if seed == 0 else "%s_s%d" % (exp, seed)
+    cfg["run"] = run_name
+    cfg["out_dir"] = "/vol/runs/%s" % run_name
+    cfg["train_feats"] = cache_features.remote("train", cfg["limit"])
+    cfg["val_feats"] = cache_features.remote("validation", cfg["limit"] // 4 if cfg["limit"] else 0)
+    cfg["push_repo"] = None if (no_push or exp == "smoke") else hf_repo
     res = train.remote(cfg)
     os.makedirs("runs", exist_ok=True)
     with open("runs/%s.json" % run_name, "w") as f:
         json.dump(res, f, indent=2)
-    keys = ["laya_text_only_zero_shot", "with_image", "shuffled_image", "latency", "train_minutes"]
+    keys = ["laya_text_only_zero_shot", "with_image", "shuffled_image", "stopped", "latency", "train_minutes"]
     print(json.dumps({k: res.get(k) for k in keys}, indent=2))
-    if not no_push:
-        print("pushed (private):", push.remote(run_name, hf_repo))
+    if res.get("hf_url"):
+        print("pushed (private):", res["hf_url"])

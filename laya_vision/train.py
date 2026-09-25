@@ -1,4 +1,4 @@
-"""Pilot training: Laya (English, ModernBERT-large) + frozen SigLIP2 on A-OKVQA.
+"""Training: Laya (English, ModernBERT-large) + frozen SigLIP2 on A-OKVQA.
 
 Loss is Laya's strictly proper reward (log + spherical score), negated. With a deterministic
 reported distribution, maximizing expected proper reward reduces to minimizing this directly.
@@ -80,15 +80,37 @@ def bootstrap_ci(correct: np.ndarray, n: int = 2000, seed: int = 0):
     return float(np.percentile(s, 2.5)), float(np.percentile(s, 97.5))
 
 
-def run(cfg: Dict) -> Dict:
+def load_text_side(cfg: Dict, device: str):
+    """`laya` starts from the released checkpoint; `modernbert` is the same encoder with a fresh head (ablation)."""
+    if cfg.get("init", "laya") == "laya":
+        return load_laya(cfg["laya_id"], cfg.get("laya_subfolder"), device)
+    from laya.common import build_model
+    from transformers import AutoTokenizer
+
+    lcfg = {"encoder": "answerdotai/ModernBERT-large", "head_layers": 2, "act_costs": {"escalate": 0.5},
+            "max_len": 512, "head_max_len": 192}
+    model = build_model(lcfg).to(device)
+    model.encoder.config.reference_compile = False
+    return model, AutoTokenizer.from_pretrained(lcfg["encoder"]), lcfg
+
+
+def run(cfg: Dict, on_epoch=None) -> Dict:
+    """Train with per-epoch dev eval, LR halving on plateau, early stopping and resumable checkpoints.
+
+    The dev split is the last `dev_rows` rows of A-OKVQA train and drives every selection decision.
+    The validation split is evaluated once, on the best checkpoint, after training ends.
+    """
     from datasets import load_dataset
+    from safetensors.torch import load_file, save_file
 
     device = "cuda"
     torch.manual_seed(cfg["seed"])
     out_dir = cfg["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
+    last_path, best_path = os.path.join(out_dir, "last.pt"), os.path.join(out_dir, "model.safetensors")
+    metrics_path = os.path.join(out_dir, "metrics.jsonl")
 
-    decision, tok, lcfg = load_laya(cfg["laya_id"], cfg.get("laya_subfolder"), device)
+    decision, tok, lcfg = load_text_side(cfg, device)
     max_len, head_max_len = lcfg.get("max_len", 512), lcfg.get("head_max_len", 192)
 
     tr_cache, va_cache = torch.load(cfg["train_feats"]), torch.load(cfg["val_feats"])
@@ -96,86 +118,123 @@ def run(cfg: Dict) -> Dict:
     n_img, vdim = tr_feats.shape[1], tr_feats.shape[2]
 
     cols = ["question_id", "question", "choices", "correct_choice_idx"]
-    tr_rows = load_dataset(cfg["dataset"], split="train").select_columns(cols)
+    all_tr = load_dataset(cfg["dataset"], split="train").select_columns(cols)
     va_rows = load_dataset(cfg["dataset"], split="validation").select_columns(cols)
     if cfg.get("limit"):
-        tr_rows = tr_rows.select(range(min(cfg["limit"], len(tr_rows))))
+        all_tr = all_tr.select(range(min(cfg["limit"], len(all_tr))))
         va_rows = va_rows.select(range(min(cfg["limit"] // 4 or 1, len(va_rows))))
-    assert list(tr_rows["question_id"]) == tr_cache["question_id"][: len(tr_rows)], "train feature cache out of order"
+    assert list(all_tr["question_id"]) == tr_cache["question_id"][: len(all_tr)], "train feature cache out of order"
     assert list(va_rows["question_id"]) == va_cache["question_id"][: len(va_rows)], "val feature cache out of order"
 
-    tr_items = build_items(tr_rows, tok, n_img, train=True, seed=cfg["seed"], max_len=max_len, head_max_len=head_max_len)
-    va_items = build_items(va_rows, tok, n_img, train=False, max_len=max_len, head_max_len=head_max_len)
-    va_blind = build_items(va_rows, tok, 0, train=False, max_len=max_len, head_max_len=head_max_len)
-    print("items: train %d, val %d" % (len(tr_items), len(va_items)), flush=True)
+    n_dev = min(cfg["dev_rows"], len(all_tr) // 5)
+    n_tr = len(all_tr) - n_dev
+    tr_rows = [all_tr[i] for i in range(n_tr)]
+    dev_rows = [all_tr[i] for i in range(n_tr, len(all_tr))]
+    dev_feats = tr_feats[n_tr:]
+    kw = dict(max_len=max_len, head_max_len=head_max_len)
+    dev_items = build_items(dev_rows, tok, n_img, train=False, **kw)
+    va_items = build_items(va_rows, tok, n_img, train=False, **kw)
+    va_blind = build_items(va_rows, tok, 0, train=False, **kw)
+    print("rows: train %d, dev %d, val %d" % (n_tr, n_dev, len(va_rows)), flush=True)
 
     model = VisionDecisionModel(decision, vdim, n_img).to(device)
+    if not cfg.get("train_text", True):
+        for p in model.decision.encoder.parameters():
+            p.requires_grad_(False)
     pad = tok.pad_token_id
-    results = {"config": cfg, "n_img_tokens": n_img}
 
-    # Baseline: released Laya, question and options only, no image. What the text prior alone gets.
-    results["laya_text_only_zero_shot"] = evaluate(model, va_blind, None, pad, device, use_image=False)
-    print("zero-shot text-only:", results["laya_text_only_zero_shot"], flush=True)
-
-    new = [p for n, p in model.named_parameters() if not n.startswith("decision.")]
-    old = [p for n, p in model.named_parameters() if n.startswith("decision.")]
+    new = [p for n, p in model.named_parameters() if not n.startswith("decision.") and p.requires_grad]
+    old = [p for n, p in model.named_parameters() if n.startswith("decision.") and p.requires_grad]
     opt = torch.optim.AdamW([{"params": new, "lr": cfg["lr_new"]}, {"params": old, "lr": cfg["lr_text"]}], weight_decay=0.01)
-    steps = cfg["epochs"] * math.ceil(len(tr_items) / cfg["batch_size"])
-    warm = max(1, int(0.05 * steps))
-    sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda s: min(1.0, (s + 1) / warm) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / steps)))
-    )
+    steps_per_epoch = math.ceil(2 * n_tr / cfg["batch_size"])
+    warm = max(1, int(cfg.get("warmup_epochs", 0.5) * steps_per_epoch))
+    base_lrs = [g["lr"] for g in opt.param_groups]
 
-    step, t0, log = 0, time.time(), []
-    for ep in range(cfg["epochs"]):
+    state = {"epoch": 0, "step": 0, "best": -1.0, "best_epoch": -1, "bad": 0, "lr_scale": 1.0, "t_train": 0.0}
+    results = {"config": cfg, "n_img_tokens": n_img, "rows": {"train": n_tr, "dev": n_dev, "val": len(va_rows)}}
+    if os.path.exists(last_path):
+        ck = torch.load(last_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(ck["model"])
+        opt.load_state_dict(ck["opt"])
+        state, results = ck["state"], ck["results"]
+        print("resumed at epoch %d (best dev %.4f @ %d)" % (state["epoch"], state["best"], state["best_epoch"]), flush=True)
+    else:
+        # Baseline: released Laya, question and options only. The text-prior floor.
+        results["laya_text_only_zero_shot"] = evaluate(model, va_blind, None, pad, device, use_image=False)
+        print("zero-shot text-only:", results["laya_text_only_zero_shot"], flush=True)
+
+    while state["epoch"] < cfg["max_epochs"] and state["bad"] < cfg["patience"]:
+        ep, t0 = state["epoch"], time.time()
+        # fresh option order and noul candidates every epoch
+        tr_items = build_items(tr_rows, tok, n_img, train=True, seed=cfg["seed"] * 1000 + ep, **kw)
         model.train()
-        for chunk in batches(tr_items, cfg["batch_size"], shuffle=True, seed=cfg["seed"] + ep):
+        losses = []
+        for chunk in batches(tr_items, cfg["batch_size"], shuffle=True, seed=cfg["seed"] * 1000 + ep):
+            s = state["step"]
+            for g, lr in zip(opt.param_groups, base_lrs):
+                g["lr"] = lr * state["lr_scale"] * min(1.0, (s + 1) / warm)
             b = collate(chunk, pad, tr_feats)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 logits = forward(model, b, device, True)
-            mask = b["marker_mask"].to(device).float()
             p = torch.softmax(logits.float(), -1)
-            loss = -proper_reward(p, b["target"].to(device), b["qtype"].to(device), mask).mean()
+            loss = -proper_reward(p, b["target"].to(device), b["qtype"].to(device), b["marker_mask"].to(device).float()).mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            sched.step()
-            step += 1
-            if step % 50 == 0:
-                log.append({"step": step, "loss": float(loss), "elapsed_s": round(time.time() - t0, 1)})
-                print(log[-1], flush=True)
-        ev = evaluate(model, va_items, va_feats, pad, device)
-        print("epoch %d val:" % ep, ev, flush=True)
-        results.setdefault("per_epoch", []).append(ev)
+            state["step"] += 1
+            losses.append(float(loss))
 
-    results["train_log"] = log
-    results["train_minutes"] = round((time.time() - t0) / 60, 2)
+        dev = evaluate(model, dev_items, dev_feats, pad, device)
+        score = dev["choice_acc"]
+        improved = score > state["best"] + cfg.get("min_delta", 0.0)
+        if improved:
+            state.update(best=score, best_epoch=ep, bad=0)
+            save_file({k: v.half().contiguous() for k, v in model.state_dict().items()}, best_path)
+        else:
+            state["bad"] += 1
+            if state["bad"] % cfg["lr_halve_after"] == 0:
+                state["lr_scale"] *= 0.5
+        state["epoch"] += 1
+        state["t_train"] += time.time() - t0
+        rec = {"epoch": ep, "train_loss": float(np.mean(losses)), "dev": dev, "best_dev": state["best"],
+               "best_epoch": state["best_epoch"], "bad": state["bad"], "lr_scale": state["lr_scale"],
+               "epoch_min": round((time.time() - t0) / 60, 2)}
+        print("epoch", json.dumps(rec), flush=True)
+        with open(metrics_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "state": state, "results": results}, last_path)
+        if on_epoch:
+            on_epoch()
+
+    results["stopped"] = {"epochs_run": state["epoch"], "best_epoch": state["best_epoch"], "best_dev_choice_acc": state["best"],
+                          "reason": "patience" if state["bad"] >= cfg["patience"] else "max_epochs"}
+    results["train_minutes"] = round(state["t_train"] / 60, 1)
+
+    # One untouched evaluation on validation, with the dev-selected checkpoint.
+    model.load_state_dict({k: v.float() for k, v in load_file(best_path).items()})
     results["with_image"] = evaluate(model, va_items, va_feats, pad, device)
-    # Ablation: each question gets another question's image. A drop here means the image is used.
     perm = torch.randperm(len(va_feats), generator=torch.Generator().manual_seed(1))
     results["shuffled_image"] = evaluate(model, va_items, va_feats[perm], pad, device)
-
-    ch = [it for it in va_items if it["kind"] == "choice"]
-    b_all = []
+    correct = []
     model.eval()
     with torch.no_grad():
-        for chunk in batches(ch, 64, False):
+        for chunk in batches([it for it in va_items if it["kind"] == "choice"], 64, False):
             b = collate(chunk, pad, va_feats)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                pred = forward(model, b, device, True).argmax(-1).cpu()
-            b_all.extend((pred == b["label"]).tolist())
-    results["with_image"]["choice_acc_ci95"] = bootstrap_ci(np.array(b_all, dtype=float))
-
+                correct.extend((forward(model, b, device, True).argmax(-1).cpu() == b["label"]).tolist())
+    results["with_image"]["choice_acc_ci95"] = bootstrap_ci(np.array(correct, dtype=float))
     results["latency"] = bench_latency(model, tok, cfg, max_len, head_max_len, device)
+
     with open(os.path.join(out_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
-
-    from safetensors.torch import save_file
-
-    save_file({k: v.half().contiguous() for k, v in model.state_dict().items()}, os.path.join(out_dir, "model.safetensors"))
     with open(os.path.join(out_dir, "laya_vision_config.json"), "w") as f:
-        json.dump({"laya": lcfg, "laya_id": cfg["laya_id"], "vision_id": cfg["vision_id"], "n_img": n_img, "vision_dim": vdim, "pool": 2}, f, indent=2)
+        json.dump({"laya": lcfg, "init": cfg.get("init", "laya"), "laya_id": cfg["laya_id"], "vision_id": cfg["vision_id"],
+                   "n_img": n_img, "vision_dim": vdim, "pool": 2}, f, indent=2)
+    if os.path.exists(last_path):
+        os.remove(last_path)  # optimizer state is ~5 GB; the best weights are what matter now
+    if on_epoch:
+        on_epoch()
     return results
 
 
