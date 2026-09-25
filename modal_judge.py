@@ -33,11 +33,11 @@ CFG = {
     "val_rows": 0,            # A-OKVQA validation rows, 0 = all 1,145
     "test_prompts": 0,        # GenAI-Bench test prompts, 0 = all 400 (x6 images)
     # vlm_head training
-    "aokvqa_rows": 6000,
+    "aokvqa_rows": 4000,
     "swap_pairs": 0.5,
     "genai_prompts": 0,       # GenAI-Bench train prompts, 0 = all 1,200
     "batch_size": 8,
-    "eval_batch_size": 16,
+    "eval_batch_size": 32,
     "lr_lora": 1e-4,
     "lr_head": 1e-3,
     "lora_r": 16,

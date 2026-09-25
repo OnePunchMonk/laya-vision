@@ -38,8 +38,16 @@ def chat(proc, text: str, generation_prompt: bool) -> str:
     return proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=generation_prompt)
 
 
+_POOL = None
+
+
 def _images(examples, image_fns):
-    return [f() for f in (image_fns or [e.image_fn for e in examples])]
+    """Decode and resize in threads; on A100 the single-threaded PIL path was the bottleneck."""
+    global _POOL
+    if _POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _POOL = ThreadPoolExecutor(8)
+    return list(_POOL.map(lambda f: f(), image_fns or [e.image_fn for e in examples]))
 
 
 def _chunks(n: int, bs: int):
@@ -122,7 +130,7 @@ class CaptionLayaJudge:
         t0 = time.time()
         for sl in _chunks(len(keys), self.bs):
             ks = keys[sl]
-            b = proc(text=[chat(proc, CAPTION_PROMPT, True)] * len(ks), images=[todo[k]() for k in ks], return_tensors="pt", padding=True).to(model.device)
+            b = proc(text=[chat(proc, CAPTION_PROMPT, True)] * len(ks), images=_images(None, [todo[k] for k in ks]), return_tensors="pt", padding=True).to(model.device)
             gen = model.generate(**b, max_new_tokens=self.max_new, do_sample=False)
             for k, g in zip(ks, proc.batch_decode(gen[:, b["input_ids"].shape[1]:], skip_special_tokens=True)):
                 self.captions[k] = g.strip()
